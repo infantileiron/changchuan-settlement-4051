@@ -29,11 +29,11 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 恰好frontend/backend/worker/db/redis；数据库、Redis和共享心跳产物具名卷。清理 `docker compose down -v --remove-orphans`，保留数据时省略 `-v`。
 
-目录：`backend/src/{models,schemas,services,controllers,routes}`按六实体分层；`input_records.py`校验、`compatibility.py`硬约束与非货币评分、`hungarian.py`双侧拒配、`subset_sum.py`受限组合、`reconcile.py`两阶段及输入哈希。`config,utils,middlewares`提供数据库、JWT/口令摘要、队列、审计和错误。种子在 `backend/scripts/seed_demo.py`，`migrations/001_schema.sql`说明新库基线，实际以元数据建表。
+目录：`backend/src/{models,schemas,services,controllers,routes}`按六实体分层；`input_records.py`校验、`compatibility.py`硬约束与非货币评分、`hungarian.py`双侧拒配与对偶推导、`ambiguity.py`等号图SCC歧义分析与替代方案枚举、`export_csv.py`归档CSV纯函数构建、`subset_sum.py`受限组合、`reconcile.py`两阶段及输入哈希。`backend/tests/`含歧义穷举对照与reconcile/导出集成测试（纯Python匈牙利参考实现，无SciPy也可运行）。`config,utils,middlewares`提供数据库、JWT/口令摘要、队列、审计和错误。种子在 `backend/scripts/seed_demo.py`，`migrations/001_schema.sql`说明新库基线，实际以元数据建表。
 
 前端 `src/{api,stores,types,constants,hooks,utils,router,pages}`，MatchMetrics/MatchFlow/MatchLedger/UnmatchedTable跨总览、结果、归档复用。测试、截图、日志位于批次外层 `test-artifacts/gb-2308`，不进入本源码目录。
 
-本地开发：安装requirements，设置可用DATABASE_URL/REDIS_URL，从backend启动 `uvicorn src.main:app --reload`，另起 `python -m src.worker`；前端 `npm ci && npm run dev`，构建 `npm run build`。默认OpenBLAS/OMP线程1。环境变量COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET、SEED_DEMO；Compose内部提供DATABASE_URL/REDIS_URL。`.env`忽略，演示密钥与口令仅供本地模拟，部署使用独立配置。
+本地开发：安装requirements，设置可用DATABASE_URL/REDIS_URL，从backend启动 `uvicorn src.main:app --reload`，另起 `python -m src.worker`；前端 `npm ci && npm run dev`，构建 `npm run build`。默认OpenBLAS/OMP线程1。无原生依赖时可在backend目录用 `python -I tests/test_ambiguity.py` 与 `python -I tests/test_reconcile_ambiguity.py` 跑穷举对照测试（内置纯Python匈牙利参考实现）；装好requirements后同样命令即覆盖真实SciPy对偶推导路径。环境变量COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET、SEED_DEMO；Compose内部提供DATABASE_URL/REDIS_URL。`.env`忽略，演示密钥与口令仅供本地模拟，部署使用独立配置。
 
 ## 账号与权限
 
@@ -68,6 +68,16 @@ CSV列 `external_id,side,party,reference,amount_cents,currency,booking_date`。s
 这是非货币排序分，不是金额。每个未配委托和未配凭证分别付reject_cost分。扩展矩阵大小M+N：真实兼容边、每项专属拒配dummy、dummy互配零分；禁配边上界大于全部拒配的可行方案，故不会强选禁配。匈牙利法在此矩阵求全局最小总分，昂贵兼容边也可被拒配。一个真实配对替代两项拒配分。
 
 手算 `[[1,9],[8,2]]` 的最优对角总分3；单个禁配或成本50而单侧拒配6时选择双侧拒配，总分12。
+
+### 一对一最优解歧义分析
+
+匈牙利法只返回一组最优配对，同额同日时若干配对只是任选。第一阶段在同一拒配成本口径上额外产出 `phase_one.ambiguity`，回答“哪些关联其实可替换”：
+
+- **等号图与强连通分量（SCC）**：由最优完美匹配推导一组可行对偶 `u/v`（SciPy 不直接暴露，本项目用差分约束最短路推导并校验可行性），满足 `c_ij = u_i+v_j` 的边为紧边；残量有向图上与匹配边同 SCC 的紧边，必能出现在某个全局最优完美匹配中。列节点整体偏移 `size` 编号，避免行/列编号空间重叠。
+- **逐笔可入最优的委托与未配可能**：`ambiguous_edges` 列出每条可进入某最优方案的真实委托-凭证配对；`can_reject_milestones` / `can_reject_receipts` 列出可在某最优方案中保持未配（走双侧拒配 dummy）的分录，成本仍为双方拒配分。
+- **可回查替代方案**：`alternatives` 沿等号图交替有向环翻转枚举替代最优匹配，按“真实配对+真实拒配”规范化去重（dummy 互配零边的排列视为同一方案）。每个替代方案目标总分与基线相同，且任一方案内委托/凭证最多消耗一次；求解器原始配对始终保留在 `phase_one.matches`，分析不改变现有分配。
+- **大批量降级**：枚举受 `max_alternatives`（默认200）与墙上时间预算（默认3秒）限制。超时或达上限时 `status=degraded`、`alternatives_truncated=true` 并给出 `truncated_reason`；允许边与可拒配项仍由 SCC 完整判定，**截断不等于没有歧义**。对偶推导或分析本身失败时 `status=failed`，同样显式标注，绝不静默当作唯一解。
+- **旧数据兼容**：归档导出对不含 `ambiguity` 的历史结果输出“旧版运行结果……不代表无歧义”说明行；底稿页与归档页共用 `AmbiguityPanel` 与同一 CSV 构建函数，展示口径一致。
 
 ## 第二阶段：整数分受限子集和
 
